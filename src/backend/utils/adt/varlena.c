@@ -4206,6 +4206,10 @@ pg_column_compression(PG_FUNCTION_ARGS)
 		case TOAST_LZ4_COMPRESSION_ID:
 			result = "lz4";
 			break;
+		case TOAST_EXTENDED_COMPRESSION_ID:
+			/* Extended format currently only supports zstd */
+			result = "zstd";
+			break;
 		default:
 			elog(ERROR, "invalid compression method id %d", cmid);
 	}
@@ -4222,7 +4226,7 @@ pg_column_toast_chunk_id(PG_FUNCTION_ARGS)
 {
 	int			typlen;
 	struct varlena *attr;
-	struct varatt_external toast_pointer;
+	Oid			valueid;
 
 	/* On first call, get the input type's typlen, and save at *fn_extra */
 	if (fcinfo->flinfo->fn_extra == NULL)
@@ -4249,9 +4253,25 @@ pg_column_toast_chunk_id(PG_FUNCTION_ARGS)
 	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
 		PG_RETURN_NULL();
 
-	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+	/*
+	 * Handle both legacy 16-byte and extended 20-byte on-disk TOAST pointers.
+	 */
+	if (VARTAG_EXTERNAL(attr) == VARTAG_ONDISK_EXTENDED)
+	{
+		struct varatt_external_extended toast_pointer_ext;
 
-	PG_RETURN_OID(toast_pointer.va_valueid);
+		VARATT_EXTERNAL_GET_POINTER_EXTENDED(toast_pointer_ext, attr);
+		valueid = toast_pointer_ext.va_valueid;
+	}
+	else
+	{
+		struct varatt_external toast_pointer;
+
+		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+		valueid = toast_pointer.va_valueid;
+	}
+
+	PG_RETURN_OID(valueid);
 }
 
 /*

@@ -1665,6 +1665,8 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	uint16		infomask;
 	CompactAttribute *thisatt;
 	struct varatt_external toast_pointer;
+	struct varatt_external_extended toast_pointer_ext;
+	bool		is_extended;
 
 	infomask = ctx->tuphdr->t_infomask;
 	thisatt = TupleDescCompactAttr(RelationGetDescr(ctx->rel), ctx->attnum);
@@ -1717,13 +1719,14 @@ check_tuple_attribute(HeapCheckContext *ctx)
 
 	/*
 	 * Check that VARTAG_SIZE won't hit an Assert on a corrupt va_tag before
-	 * risking a call into att_addlength_pointer
+	 * risking a call into att_addlength_pointer.  Both legacy (VARTAG_ONDISK)
+	 * and extended (VARTAG_ONDISK_EXTENDED) on-disk formats are valid.
 	 */
 	if (VARATT_IS_EXTERNAL(tp + ctx->offset))
 	{
 		uint8		va_tag = VARTAG_EXTERNAL(tp + ctx->offset);
 
-		if (va_tag != VARTAG_ONDISK)
+		if (va_tag != VARTAG_ONDISK && va_tag != VARTAG_ONDISK_EXTENDED)
 		{
 			report_corruption(ctx,
 							  psprintf("toasted attribute has unexpected TOAST tag %u",
@@ -1768,9 +1771,23 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	/* It is external, and we're looking at a page on disk */
 
 	/*
-	 * Must copy attr into toast_pointer for alignment considerations
+	 * Must copy attr into toast_pointer for alignment considerations.
+	 * Handle both legacy (VARTAG_ONDISK) and extended (VARTAG_ONDISK_EXTENDED)
+	 * formats.
 	 */
-	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+	is_extended = (VARTAG_EXTERNAL(attr) == VARTAG_ONDISK_EXTENDED);
+
+	if (is_extended)
+	{
+		VARATT_EXTERNAL_GET_POINTER_EXTENDED(toast_pointer_ext, attr);
+		/* Copy common fields for simpler code below */
+		toast_pointer.va_rawsize = toast_pointer_ext.va_rawsize;
+		toast_pointer.va_extinfo = toast_pointer_ext.va_extinfo;
+		toast_pointer.va_valueid = toast_pointer_ext.va_valueid;
+		toast_pointer.va_toastrelid = toast_pointer_ext.va_toastrelid;
+	}
+	else
+		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
 
 	/* Toasted attributes too large to be untoasted should never be stored */
 	if (toast_pointer.va_rawsize > VARLENA_SIZE_LIMIT)
@@ -1785,14 +1802,38 @@ check_tuple_attribute(HeapCheckContext *ctx)
 		ToastCompressionId cmid;
 		bool		valid = false;
 
-		/* Compressed attributes should have a valid compression method */
-		cmid = TOAST_COMPRESS_METHOD(&toast_pointer);
+		/*
+		 * Compressed attributes should have a valid compression method.
+		 * For extended pointers with cmid==3, the actual method is in va_data[0].
+		 */
+		cmid = VARATT_EXTERNAL_GET_COMPRESS_METHOD(toast_pointer);
 		switch (cmid)
 		{
 				/* List of all valid compression method IDs */
 			case TOAST_PGLZ_COMPRESSION_ID:
 			case TOAST_LZ4_COMPRESSION_ID:
 				valid = true;
+				break;
+
+				/* Extended compression (zstd or pglz/lz4 in extended format) */
+			case TOAST_EXTENDED_COMPRESSION_ID:
+				if (is_extended)
+				{
+					uint8	ext_method = VARATT_EXTERNAL_GET_EXT_COMPRESSION_METHOD(toast_pointer_ext);
+
+					/* Validate extended compression method */
+					switch (ext_method)
+					{
+						case TOAST_PGLZ_EXT_METHOD:
+						case TOAST_LZ4_EXT_METHOD:
+						case TOAST_ZSTD_EXT_METHOD:
+							valid = true;
+							break;
+						default:
+							/* Invalid extended method will be reported below */
+							break;
+					}
+				}
 				break;
 
 				/* Recognized but invalid compression method ID */
@@ -1840,7 +1881,21 @@ check_tuple_attribute(HeapCheckContext *ctx)
 
 		ta = palloc0_object(ToastedAttribute);
 
-		VARATT_EXTERNAL_GET_POINTER(ta->toast_pointer, attr);
+		/*
+		 * Extract toast pointer based on format.  For extended format,
+		 * copy common fields from toast_pointer which we already extracted
+		 * above.
+		 */
+		if (is_extended)
+		{
+			ta->toast_pointer.va_rawsize = toast_pointer.va_rawsize;
+			ta->toast_pointer.va_extinfo = toast_pointer.va_extinfo;
+			ta->toast_pointer.va_valueid = toast_pointer.va_valueid;
+			ta->toast_pointer.va_toastrelid = toast_pointer.va_toastrelid;
+		}
+		else
+			VARATT_EXTERNAL_GET_POINTER(ta->toast_pointer, attr);
+
 		ta->blkno = ctx->blkno;
 		ta->offnum = ctx->offnum;
 		ta->attnum = ctx->attnum;

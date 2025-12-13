@@ -1,0 +1,37 @@
+--
+-- Tests for extended TOAST header structures and zstd compression
+--
+CREATE EXTENSION test_toast_ext;
+-- Use dedicated schema for test isolation
+CREATE SCHEMA test_toast_ext_schema;
+SET search_path TO test_toast_ext_schema, public;
+-- Compile-time validation tests (always run)
+-- These error out on failure, so completing without error = pass
+SELECT test_toast_structure_sizes();
+ test_toast_structure_sizes
+----------------------------
+
+(1 row)
+
+SELECT test_toast_flag_validation();
+ test_toast_flag_validation
+----------------------------
+
+(1 row)
+
+SELECT test_toast_compression_ids();
+ test_toast_compression_ids
+----------------------------
+
+(1 row)
+
+--
+-- Functional tests for zstd TOAST compression
+-- Skip if not built with USE_ZSTD
+--
+SELECT NOT(enumvals @> '{zstd}') AS skip_test FROM pg_settings WHERE
+  name = 'default_toast_compression' \gset
+\if :skip_test
+   \echo '*** skipping TOAST tests with zstd (not supported) ***'
+*** skipping TOAST tests with zstd (not supported) ***
+   \quit

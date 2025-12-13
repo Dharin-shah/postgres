@@ -1,0 +1,187 @@
+--
+-- Tests for extended TOAST header structures and zstd compression
+--
+CREATE EXTENSION test_toast_ext;
+-- Use dedicated schema for test isolation
+CREATE SCHEMA test_toast_ext_schema;
+SET search_path TO test_toast_ext_schema, public;
+-- Compile-time validation tests (always run)
+-- These error out on failure, so completing without error = pass
+SELECT test_toast_structure_sizes();
+ test_toast_structure_sizes
+----------------------------
+
+(1 row)
+
+SELECT test_toast_flag_validation();
+ test_toast_flag_validation
+----------------------------
+
+(1 row)
+
+SELECT test_toast_compression_ids();
+ test_toast_compression_ids
+----------------------------
+
+(1 row)
+
+--
+-- Functional tests for zstd TOAST compression
+-- Skip if not built with USE_ZSTD
+--
+SELECT NOT(enumvals @> '{zstd}') AS skip_test FROM pg_settings WHERE
+  name = 'default_toast_compression' \gset
+\if :skip_test
+   \echo '*** skipping TOAST tests with zstd (not supported) ***'
+   \quit
+\endif
+-- Test basic zstd compression
+CREATE TABLE test_zstd_basic (id serial, data text COMPRESSION zstd);
+INSERT INTO test_zstd_basic (data)
+    VALUES (repeat('PostgreSQL zstd TOAST compression test. ', 3000));
+SELECT id,
+       pg_column_compression(data) AS compression,
+       length(data) AS data_length,
+       left(data, 42) AS data_prefix
+FROM test_zstd_basic;
+ id | compression | data_length |                data_prefix
+----+-------------+-------------+--------------------------------------------
+  1 | zstd        |      120000 | PostgreSQL zstd TOAST compression test. Po
+(1 row)
+
+-- Test slice access
+SELECT id, substr(data, 100, 42) AS slice FROM test_zstd_basic;
+ id |                   slice
+----+--------------------------------------------
+  1 | ST compression test. PostgreSQL zstd TOAST
+(1 row)
+
+-- Test UPDATE
+UPDATE test_zstd_basic SET data = repeat('Updated zstd data for TOAST test. ', 3000);
+SELECT id,
+       pg_column_compression(data) AS compression,
+       length(data) AS data_length,
+       left(data, 35) AS data_prefix
+FROM test_zstd_basic;
+ id | compression | data_length |             data_prefix
+----+-------------+-------------+-------------------------------------
+  1 | zstd        |      102000 | Updated zstd data for TOAST test. U
+(1 row)
+
+-- Test extended header with pglz
+SET use_extended_toast_header = on;
+CREATE TABLE test_pglz_extended (data text COMPRESSION pglz);
+INSERT INTO test_pglz_extended (data)
+    VALUES (repeat('PGLZ with extended header format. ', 3000));
+SELECT pg_column_compression(data) AS compression,
+       length(data) AS data_length
+FROM test_pglz_extended;
+ compression | data_length
+-------------+-------------
+ pglz        |      102000
+(1 row)
+
+SELECT substr(data, 50, 34) AS slice FROM test_pglz_extended;
+               slice
+------------------------------------
+ ded header format. PGLZ with exten
+(1 row)
+
+-- Test data integrity
+CREATE TABLE test_integrity (
+    method text,
+    original_data text,
+    compressed_data text
+);
+INSERT INTO test_integrity VALUES
+    ('pglz', repeat('Integrity test data pattern. ', 2000), NULL),
+    ('zstd', repeat('Integrity test data pattern. ', 2000), NULL);
+CREATE TABLE test_pglz_integrity (data text COMPRESSION pglz);
+CREATE TABLE test_zstd_integrity (data text COMPRESSION zstd);
+INSERT INTO test_pglz_integrity SELECT original_data FROM test_integrity WHERE method = 'pglz';
+INSERT INTO test_zstd_integrity SELECT original_data FROM test_integrity WHERE method = 'zstd';
+SELECT 'pglz' AS method,
+       md5((SELECT original_data FROM test_integrity WHERE method = 'pglz')) =
+       md5((SELECT data FROM test_pglz_integrity)) AS checksum_match;
+ method | checksum_match
+--------+----------------
+ pglz   | t
+(1 row)
+
+SELECT 'zstd' AS method,
+       md5((SELECT original_data FROM test_integrity WHERE method = 'zstd')) =
+       md5((SELECT data FROM test_zstd_integrity)) AS checksum_match;
+ method | checksum_match
+--------+----------------
+ zstd   | t
+(1 row)
+
+-- Test CLUSTER and VACUUM FULL
+CREATE TABLE test_cluster_zstd (id serial PRIMARY KEY, data text COMPRESSION zstd);
+INSERT INTO test_cluster_zstd (data)
+    VALUES (repeat('Data for CLUSTER test with zstd compression. ', 2500));
+SELECT 'before_cluster' AS stage, md5(data) AS hash FROM test_cluster_zstd;
+     stage      |               hash
+----------------+----------------------------------
+ before_cluster | b4132e799bbd065a7e9266159aa82dc1
+(1 row)
+
+CLUSTER test_cluster_zstd USING test_cluster_zstd_pkey;
+SELECT 'after_cluster' AS stage,
+       pg_column_compression(data) AS compression,
+       md5(data) AS hash
+FROM test_cluster_zstd;
+     stage     | compression |               hash
+---------------+-------------+----------------------------------
+ after_cluster | zstd        | b4132e799bbd065a7e9266159aa82dc1
+(1 row)
+
+VACUUM FULL test_cluster_zstd;
+SELECT 'after_vacuum_full' AS stage,
+       pg_column_compression(data) AS compression,
+       md5(data) AS hash
+FROM test_cluster_zstd;
+       stage       | compression |               hash
+-------------------+-------------+----------------------------------
+ after_vacuum_full | zstd        | b4132e799bbd065a7e9266159aa82dc1
+(1 row)
+
+-- Test GUC toggling (mixed formats in same table)
+SET use_extended_toast_header = on;
+CREATE TABLE test_guc_toggle (id serial, data text COMPRESSION pglz);
+INSERT INTO test_guc_toggle (data)
+    VALUES (repeat('Data created with extended header on. ', 3000));
+SELECT 'with_ext_on' AS stage,
+       pg_column_compression(data) AS compression,
+       length(data) AS data_length
+FROM test_guc_toggle;
+    stage    | compression | data_length
+-------------+-------------+-------------
+ with_ext_on | pglz        |      114000
+(1 row)
+
+SET use_extended_toast_header = off;
+INSERT INTO test_guc_toggle (data)
+    VALUES (repeat('Data created with extended header off. ', 3000));
+SELECT id,
+       pg_column_compression(data) AS compression,
+       length(data) AS data_length,
+       left(data, 39) AS data_prefix
+FROM test_guc_toggle ORDER BY id;
+ id | compression | data_length |               data_prefix
+----+-------------+-------------+-----------------------------------------
+  1 | pglz        |      114000 | Data created with extended header on. D
+  2 | pglz        |      117000 | Data created with extended header off.
+(2 rows)
+
+SET use_extended_toast_header = on;
+SELECT id, length(data) AS data_length FROM test_guc_toggle ORDER BY id;
+ id | data_length
+----+-------------
+  1 |      114000
+  2 |      117000
+(2 rows)
+
+-- Cleanup
+DROP SCHEMA test_toast_ext_schema CASCADE;
+DROP EXTENSION test_toast_ext;
