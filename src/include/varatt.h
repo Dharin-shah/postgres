@@ -80,13 +80,19 @@ typedef struct varatt_expanded
  * Type tag for the various sorts of "TOAST pointer" datums.  The peculiar
  * value for VARTAG_ONDISK comes from a requirement for on-disk compatibility
  * with a previous notion that the tag field was the pointer datum's length.
+ *
+ * VARTAG_ONDISK_ZSTD is used for ZSTD-compressed external TOAST data.
+ * Unlike pglz and lz4 which store the compression method in va_extinfo bits
+ * 30-31, ZSTD uses a separate vartag to preserve all 32 bits of va_extinfo
+ * for future use (compression level, dictionary ID, etc.).
  */
 typedef enum vartag_external
 {
 	VARTAG_INDIRECT = 1,
 	VARTAG_EXPANDED_RO = 2,
 	VARTAG_EXPANDED_RW = 3,
-	VARTAG_ONDISK = 18
+	VARTAG_ONDISK = 18,
+	VARTAG_ONDISK_ZSTD = 19
 } vartag_external;
 
 /* Is a TOAST pointer either type of expanded-object pointer? */
@@ -105,7 +111,7 @@ VARTAG_SIZE(vartag_external tag)
 		return sizeof(varatt_indirect);
 	else if (VARTAG_IS_EXPANDED(tag))
 		return sizeof(varatt_expanded);
-	else if (tag == VARTAG_ONDISK)
+	else if (tag == VARTAG_ONDISK || tag == VARTAG_ONDISK_ZSTD)
 		return sizeof(varatt_external);
 	else
 	{
@@ -361,6 +367,13 @@ static inline bool
 VARATT_IS_EXTERNAL_ONDISK(const void *PTR)
 {
 	return VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_ONDISK;
+}
+
+/* Is varlena datum a pointer to on-disk ZSTD-compressed toasted data? */
+static inline bool
+VARATT_IS_EXTERNAL_ONDISK_ZSTD(const void *PTR)
+{
+	return VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_ONDISK_ZSTD;
 }
 
 /* Is varlena datum an indirect pointer? */

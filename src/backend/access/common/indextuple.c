@@ -20,6 +20,7 @@
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
 #include "access/itup.h"
+#include "access/toast_compression.h"
 #include "access/toast_internals.h"
 
 /*
@@ -123,9 +124,28 @@ index_form_tuple_context(TupleDesc tupleDescriptor,
 			 att->attstorage == TYPSTORAGE_MAIN))
 		{
 			Datum		cvalue;
+			char		cmethod = att->attcompression;
+
+			/*
+			 * Index tuples must be self-contained (cannot reference external TOAST).
+			 * ZSTD compression uses external storage only (identified by vartag rather
+			 * than inline tcinfo bits). For indexed values declared COMPRESSION zstd,
+			 * fall back to inline-capable compression: prefer LZ4 when available, else PGLZ.
+			 *
+			 * Use explicit method rather than default_toast_compression so fallback
+			 * works even when default is zstd.
+			 */
+			if (cmethod == TOAST_ZSTD_COMPRESSION)
+			{
+#ifdef USE_LZ4
+				cmethod = TOAST_LZ4_COMPRESSION;
+#else
+				cmethod = TOAST_PGLZ_COMPRESSION;
+#endif
+			}
 
 			cvalue = toast_compress_datum(untoasted_values[i],
-										  att->attcompression);
+										  cmethod);
 
 			if (DatumGetPointer(cvalue) != NULL)
 			{

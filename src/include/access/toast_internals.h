@@ -36,11 +36,17 @@ typedef struct toast_compress_header
 #define TOAST_COMPRESS_METHOD(ptr) \
 	(((toast_compress_header *) (ptr))->tcinfo >> VARLENA_EXTSIZE_BITS)
 
+/*
+ * Set compression header info. Zstd uses TOAST_INVALID_COMPRESSION_ID, not
+ * TOAST_ZSTD_COMPRESSION_ID (cmid=3 is not used in tcinfo).
+ */
 #define TOAST_COMPRESS_SET_SIZE_AND_COMPRESS_METHOD(ptr, len, cm_method) \
 	do { \
 		Assert((len) > 0 && (len) <= VARLENA_EXTSIZE_MASK); \
 		Assert((cm_method) == TOAST_PGLZ_COMPRESSION_ID || \
-			   (cm_method) == TOAST_LZ4_COMPRESSION_ID); \
+			   (cm_method) == TOAST_LZ4_COMPRESSION_ID || \
+			   (cm_method) == TOAST_INVALID_COMPRESSION_ID); \
+		Assert((cm_method) != TOAST_ZSTD_COMPRESSION_ID); \
 		((toast_compress_header *) (ptr))->tcinfo = \
 			(len) | ((uint32) (cm_method) << VARLENA_EXTSIZE_BITS); \
 	} while (0)
@@ -50,7 +56,7 @@ extern Oid	toast_get_valid_index(Oid toastoid, LOCKMODE lock);
 
 extern void toast_delete_datum(Relation rel, Datum value, bool is_speculative);
 extern Datum toast_save_datum(Relation rel, Datum value,
-							  struct varlena *oldexternal, int options);
+							  struct varlena *oldexternal, char cmethod, int options);
 
 extern int	toast_open_indexes(Relation toastrel,
 							   LOCKMODE lock,

@@ -46,7 +46,23 @@ detoast_external_attr(struct varlena *attr)
 {
 	struct varlena *result;
 
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (VARATT_IS_EXTERNAL_ONDISK_ZSTD(attr))
+	{
+		/*
+		 * This is a ZSTD-compressed external datum --- fetch and decompress it
+		 */
+		struct varatt_external toast_pointer;
+		struct varlena *compressed;
+		int32		rawsize;
+
+		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+		rawsize = toast_pointer.va_rawsize - VARHDRSZ;
+
+		compressed = toast_fetch_datum(attr);
+		result = zstd_decompress_datum(compressed, rawsize);
+		pfree(compressed);
+	}
+	else if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
 		/*
 		 * This is an external stored plain value
@@ -115,7 +131,23 @@ detoast_external_attr(struct varlena *attr)
 struct varlena *
 detoast_attr(struct varlena *attr)
 {
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (VARATT_IS_EXTERNAL_ONDISK_ZSTD(attr))
+	{
+		/*
+		 * This is a ZSTD-compressed external datum --- fetch and decompress it
+		 */
+		struct varatt_external toast_pointer;
+		struct varlena *compressed;
+		int32		rawsize;
+
+		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+		rawsize = toast_pointer.va_rawsize - VARHDRSZ;
+
+		compressed = toast_fetch_datum(attr);
+		attr = zstd_decompress_datum(compressed, rawsize);
+		pfree(compressed);
+	}
+	else if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
 		/*
 		 * This is an externally stored datum --- fetch it back from there
@@ -223,7 +255,23 @@ detoast_attr_slice(struct varlena *attr,
 	else if (pg_add_s32_overflow(sliceoffset, slicelength, &slicelimit))
 		slicelength = slicelimit = -1;
 
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (VARATT_IS_EXTERNAL_ONDISK_ZSTD(attr))
+	{
+		/*
+		 * This is a ZSTD-compressed external datum --- fetch, decompress, then slice
+		 */
+		struct varatt_external toast_pointer;
+		struct varlena *compressed;
+		int32		rawsize;
+
+		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+		rawsize = toast_pointer.va_rawsize - VARHDRSZ;
+
+		compressed = toast_fetch_datum(attr);
+		preslice = zstd_decompress_datum_slice(compressed, rawsize, slicelimit >= 0 ? slicelimit : rawsize);
+		pfree(compressed);
+	}
+	else if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
 		struct varatt_external toast_pointer;
 
@@ -246,8 +294,8 @@ detoast_attr_slice(struct varlena *attr,
 			 * Determine maximum amount of compressed data needed for a prefix
 			 * of a given length (after decompression).
 			 *
-			 * At least for now, if it's LZ4 data, we'll have to fetch the
-			 * whole thing, because there doesn't seem to be an API call to
+			 * At least for now, if it's LZ4 data, we'll have to fetch
+			 * the whole thing, because there doesn't seem to be an API call to
 			 * determine how much compressed data we need to be sure of being
 			 * able to decompress the required slice.
 			 */
@@ -346,8 +394,9 @@ toast_fetch_datum(struct varlena *attr)
 	struct varlena *result;
 	struct varatt_external toast_pointer;
 	int32		attrsize;
+	bool		is_zstd = VARATT_IS_EXTERNAL_ONDISK_ZSTD(attr);
 
-	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (!VARATT_IS_EXTERNAL_ONDISK(attr) && !is_zstd)
 		elog(ERROR, "toast_fetch_datum shouldn't be called for non-ondisk datums");
 
 	/* Must copy to access aligned fields */
@@ -357,6 +406,17 @@ toast_fetch_datum(struct varlena *attr)
 
 	result = (struct varlena *) palloc(attrsize + VARHDRSZ);
 
+	/*
+	 * Set varlena header format based on how data is stored in TOAST:
+	 *
+	 * For PGLZ/LZ4: TOAST chunks contain tcinfo compression header followed
+	 * by compressed data. Mark as compressed varlena so decompression can
+	 * read the tcinfo metadata.
+	 *
+	 * For ZSTD: TOAST chunks contain only raw ZSTD compressed bytes (no tcinfo).
+	 * The compression method is identified by VARTAG_ONDISK_ZSTD instead of
+	 * tcinfo bits. Mark as plain varlena since there's no tcinfo header to parse.
+	 */
 	if (VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer))
 		SET_VARSIZE_COMPRESSED(result, attrsize + VARHDRSZ);
 	else
@@ -400,19 +460,24 @@ toast_fetch_datum_slice(struct varlena *attr, int32 sliceoffset,
 	struct varlena *result;
 	struct varatt_external toast_pointer;
 	int32		attrsize;
+	bool		is_zstd = VARATT_IS_EXTERNAL_ONDISK_ZSTD(attr);
+	bool		is_compressed;
 
-	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (!VARATT_IS_EXTERNAL_ONDISK(attr) && !is_zstd)
 		elog(ERROR, "toast_fetch_datum_slice shouldn't be called for non-ondisk datums");
 
 	/* Must copy to access aligned fields */
 	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+
+	/* For ZSTD, the vartag indicates compression; for others, check va_extinfo */
+	is_compressed = is_zstd || VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer);
 
 	/*
 	 * It's nonsense to fetch slices of a compressed datum unless when it's a
 	 * prefix -- this isn't lo_* we can't return a compressed datum which is
 	 * meaningful to toast later.
 	 */
-	Assert(!VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer) || 0 == sliceoffset);
+	Assert(!is_compressed || 0 == sliceoffset);
 
 	attrsize = VARATT_EXTERNAL_GET_EXTSIZE(toast_pointer);
 
@@ -425,7 +490,8 @@ toast_fetch_datum_slice(struct varlena *attr, int32 sliceoffset,
 	/*
 	 * When fetching a prefix of a compressed external datum, account for the
 	 * space required by va_tcinfo, which is stored at the beginning as an
-	 * int32 value.
+	 * int32 value. This only applies to pglz/lz4, not zstd (which has no
+	 * tcinfo header).
 	 */
 	if (VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer) && slicelength > 0)
 		slicelength = slicelength + sizeof(int32);
@@ -440,6 +506,10 @@ toast_fetch_datum_slice(struct varlena *attr, int32 sliceoffset,
 
 	result = (struct varlena *) palloc(slicelength + VARHDRSZ);
 
+	/*
+	 * Use compressed varlena format only for pglz/lz4 which have tcinfo.
+	 * For zstd, use plain format since payload lacks tcinfo.
+	 */
 	if (VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer))
 		SET_VARSIZE_COMPRESSED(result, slicelength + VARHDRSZ);
 	else
@@ -477,6 +547,9 @@ toast_decompress_datum(struct varlena *attr)
 	/*
 	 * Fetch the compression method id stored in the compression header and
 	 * decompress the data using the appropriate decompression routine.
+	 *
+	 * Note: Zstd external data never goes through this dispatch (it uses
+	 * VARTAG_ONDISK_ZSTD and is handled separately).
 	 */
 	cmid = TOAST_COMPRESS_METHOD(attr);
 	switch (cmid)
@@ -520,6 +593,9 @@ toast_decompress_datum_slice(struct varlena *attr, int32 slicelength)
 	/*
 	 * Fetch the compression method id stored in the compression header and
 	 * decompress the data slice using the appropriate decompression routine.
+	 *
+	 * Note: Zstd external data never goes through this dispatch (it uses
+	 * VARTAG_ONDISK_ZSTD and is handled separately).
 	 */
 	cmid = TOAST_COMPRESS_METHOD(attr);
 	switch (cmid)
@@ -547,7 +623,7 @@ toast_raw_datum_size(Datum value)
 	struct varlena *attr = (struct varlena *) DatumGetPointer(value);
 	Size		result;
 
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (VARATT_IS_EXTERNAL_ONDISK(attr) || VARATT_IS_EXTERNAL_ONDISK_ZSTD(attr))
 	{
 		/* va_rawsize is the size of the original datum -- including header */
 		struct varatt_external toast_pointer;
@@ -603,7 +679,7 @@ toast_datum_size(Datum value)
 	struct varlena *attr = (struct varlena *) DatumGetPointer(value);
 	Size		result;
 
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (VARATT_IS_EXTERNAL_ONDISK(attr) || VARATT_IS_EXTERNAL_ONDISK_ZSTD(attr))
 	{
 		/*
 		 * Attribute is stored externally - return the extsize whether
