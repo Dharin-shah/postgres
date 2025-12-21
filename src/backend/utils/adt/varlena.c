@@ -4179,6 +4179,9 @@ pg_column_compression(PG_FUNCTION_ARGS)
 		case TOAST_LZ4_COMPRESSION_ID:
 			result = "lz4";
 			break;
+		case TOAST_ZSTD_COMPRESSION_ID:
+			result = "zstd";
+			break;
 		default:
 			elog(ERROR, "invalid compression method id %d", cmid);
 	}
@@ -4219,7 +4222,8 @@ pg_column_toast_chunk_id(PG_FUNCTION_ARGS)
 
 	attr = (struct varlena *) DatumGetPointer(PG_GETARG_DATUM(0));
 
-	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (!VARATT_IS_EXTERNAL_ONDISK(attr) &&
+		!VARATT_IS_EXTERNAL_ONDISK_ZSTD(attr))
 		PG_RETURN_NULL();
 
 	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
