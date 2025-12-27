@@ -18,6 +18,7 @@
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/table.h"
+#include "access/toast_compression.h"
 #include "access/toast_internals.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -60,6 +61,9 @@ toast_compress_datum(Datum value, char cmethod)
 
 	/*
 	 * Call appropriate compression routine for the compression method.
+	 *
+	 * Note: Zstd does not support inline compression (returns NULL immediately).
+	 * Zstd data is always stored externally with VARTAG_ONDISK_ZSTD.
 	 */
 	switch (cmethod)
 	{
@@ -71,6 +75,9 @@ toast_compress_datum(Datum value, char cmethod)
 			tmp = lz4_compress_datum((const struct varlena *) DatumGetPointer(value));
 			cmid = TOAST_LZ4_COMPRESSION_ID;
 			break;
+		case TOAST_ZSTD_COMPRESSION:
+			/* Zstd: no inline compression, force external storage */
+			return PointerGetDatum(NULL);
 		default:
 			elog(ERROR, "invalid compression method %c", cmethod);
 	}
@@ -112,12 +119,13 @@ toast_compress_datum(Datum value, char cmethod)
  * rel: the main relation we're working with (not the toast rel!)
  * value: datum to be pushed to toast storage
  * oldexternal: if not NULL, toast pointer previously representing the datum
+ * cmethod: compression method for the column (from attcompression)
  * options: options to be passed to heap_insert() for toast rows
  * ----------
  */
 Datum
 toast_save_datum(Relation rel, Datum value,
-				 struct varlena *oldexternal, int options)
+				 struct varlena *oldexternal, char cmethod, int options)
 {
 	Relation	toastrel;
 	Relation   *toastidxs;
@@ -131,6 +139,8 @@ toast_save_datum(Relation rel, Datum value,
 	Pointer		dval = DatumGetPointer(value);
 	int			num_indexes;
 	int			validIndex;
+	bool		is_zstd = false;
+	struct varlena *zstd_compressed = NULL;
 
 	Assert(!VARATT_IS_EXTERNAL(dval));
 
@@ -172,18 +182,57 @@ toast_save_datum(Relation rel, Datum value,
 		/* rawsize in a compressed datum is just the size of the payload */
 		toast_pointer.va_rawsize = VARDATA_COMPRESSED_GET_EXTSIZE(dval) + VARHDRSZ;
 
-		/* set external size and compression method */
+		/*
+		 * Inline-compressed data (only pglz/lz4, never zstd).
+		 * Encode compression method from tcinfo into va_extinfo bits 30-31.
+		 */
 		VARATT_EXTERNAL_SET_SIZE_AND_COMPRESS_METHOD(toast_pointer, data_todo,
 													 VARDATA_COMPRESSED_GET_COMPRESS_METHOD(dval));
-		/* Assert that the numbers look like it's compressed */
 		Assert(VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer));
 	}
 	else
 	{
-		data_p = VARDATA(dval);
-		data_todo = VARSIZE(dval) - VARHDRSZ;
-		toast_pointer.va_rawsize = VARSIZE(dval);
-		toast_pointer.va_extinfo = data_todo;
+		/*
+		 * Uncompressed data. For zstd, compress it now before storing.
+		 * If no compression method specified, use default_toast_compression.
+		 */
+		char effective_cmethod = cmethod;
+		if (!CompressionMethodIsValid(effective_cmethod))
+			effective_cmethod = default_toast_compression;
+
+		if (effective_cmethod == TOAST_ZSTD_COMPRESSION)
+		{
+			zstd_compressed = zstd_compress_datum((const struct varlena *) dval);
+			if (likely(zstd_compressed != NULL))
+			{
+				/*
+				 * Successfully compressed with ZSTD. Store raw compressed bytes
+				 * to TOAST (no tcinfo header). VARTAG_ONDISK_ZSTD identifies the
+				 * compression method.
+				 */
+				data_p = VARDATA(zstd_compressed);
+				data_todo = VARSIZE(zstd_compressed) - VARHDRSZ;
+				toast_pointer.va_rawsize = VARSIZE(dval);
+				toast_pointer.va_extinfo = data_todo;
+				is_zstd = true;
+			}
+			else
+			{
+				/* Incompressible, store uncompressed */
+				data_p = VARDATA(dval);
+				data_todo = VARSIZE(dval) - VARHDRSZ;
+				toast_pointer.va_rawsize = VARSIZE(dval);
+				toast_pointer.va_extinfo = data_todo;
+			}
+		}
+		else
+		{
+			/* pglz/lz4 or uncompressed: store as-is */
+			data_p = VARDATA(dval);
+			data_todo = VARSIZE(dval) - VARHDRSZ;
+			toast_pointer.va_rawsize = VARSIZE(dval);
+			toast_pointer.va_extinfo = data_todo;
+		}
 	}
 
 	/*
@@ -227,7 +276,8 @@ toast_save_datum(Relation rel, Datum value,
 		{
 			struct varatt_external old_toast_pointer;
 
-			Assert(VARATT_IS_EXTERNAL_ONDISK(oldexternal));
+			Assert(VARATT_IS_EXTERNAL_ONDISK(oldexternal) ||
+				   VARATT_IS_EXTERNAL_ONDISK_ZSTD(oldexternal));
 			/* Must copy to access aligned fields */
 			VARATT_EXTERNAL_GET_POINTER(old_toast_pointer, oldexternal);
 			if (old_toast_pointer.va_toastrelid == rel->rd_toastoid)
@@ -357,10 +407,18 @@ toast_save_datum(Relation rel, Datum value,
 	table_close(toastrel, NoLock);
 
 	/*
-	 * Create the TOAST pointer value that we'll return
+	 * Free the ZSTD compressed varlena if we allocated one
+	 */
+	if (zstd_compressed != NULL)
+		pfree(zstd_compressed);
+
+	/*
+	 * Create the TOAST pointer value that we'll return.
+	 * Use VARTAG_ONDISK_ZSTD for ZSTD-compressed data to indicate compression
+	 * via the vartag rather than encoding it in va_extinfo bits 30-31.
 	 */
 	result = (struct varlena *) palloc(TOAST_POINTER_SIZE);
-	SET_VARTAG_EXTERNAL(result, VARTAG_ONDISK);
+	SET_VARTAG_EXTERNAL(result, is_zstd ? VARTAG_ONDISK_ZSTD : VARTAG_ONDISK);
 	memcpy(VARDATA_EXTERNAL(result), &toast_pointer, sizeof(toast_pointer));
 
 	return PointerGetDatum(result);
@@ -385,7 +443,7 @@ toast_delete_datum(Relation rel, Datum value, bool is_speculative)
 	int			num_indexes;
 	int			validIndex;
 
-	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (!VARATT_IS_EXTERNAL_ONDISK(attr) && !VARATT_IS_EXTERNAL_ONDISK_ZSTD(attr))
 		return;
 
 	/* Must copy to access aligned fields */
