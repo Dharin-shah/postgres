@@ -29,6 +29,70 @@ static struct varlena *toast_fetch_datum_slice(struct varlena *attr,
 static struct varlena *toast_decompress_datum(struct varlena *attr);
 static struct varlena *toast_decompress_datum_slice(struct varlena *attr, int32 slicelength);
 
+static struct varlena *toast_fetch_datum_decoded(const DecodedExternalToast *decoded);
+static struct varlena *toast_decompress_decoded(const struct varlena *compressed,
+												const DecodedExternalToast *decoded);
+
+/* ----------
+ * decode_external_toast_pointer -
+ *
+ *	Decode external varlena into DecodedExternalToast struct.
+ *	Only handles VARTAG_ONDISK with known compression methods.
+ *	Returns false for INDIRECT, EXPANDED, or unrecognized compression.
+ * ----------
+ */
+static bool
+decode_external_toast_pointer(const struct varlena *attr,
+						   DecodedExternalToast *decoded)
+{
+	struct varatt_external toast_pointer;
+	vartag_external tag;
+
+	Assert(VARATT_IS_EXTERNAL(attr));
+
+	tag = VARTAG_EXTERNAL(attr);
+
+	if (tag == VARTAG_ONDISK)
+	{
+		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+
+		decoded->toastrelid = toast_pointer.va_toastrelid;
+		decoded->valueid = toast_pointer.va_valueid;
+		decoded->rawsize = toast_pointer.va_rawsize;
+		decoded->extsize = VARATT_EXTERNAL_GET_EXTSIZE(toast_pointer);
+		decoded->flags = TOAST_EXT_IS_ONDISK;
+
+		if (VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer))
+		{
+			uint32		cmid = VARATT_EXTERNAL_GET_COMPRESS_METHOD(toast_pointer);
+
+			switch (cmid)
+			{
+				case TOAST_PGLZ_COMPRESSION_ID:
+					decoded->method = TOAST_DECOMP_PGLZ;
+					decoded->flags |= TOAST_EXT_HAS_TCINFO;
+					break;
+				case TOAST_LZ4_COMPRESSION_ID:
+					decoded->method = TOAST_DECOMP_LZ4;
+					decoded->flags |= TOAST_EXT_HAS_TCINFO;
+					break;
+				default:
+					/* Unknown compression - let caller fall back */
+					return false;
+			}
+		}
+		else
+		{
+			decoded->method = TOAST_DECOMP_NONE;
+		}
+
+		return true;
+	}
+
+	/* Not an on-disk datum (INDIRECT, EXPANDED, etc.) */
+	return false;
+}
+
 /* ----------
  * detoast_external_attr -
  *
@@ -115,57 +179,78 @@ detoast_external_attr(struct varlena *attr)
 struct varlena *
 detoast_attr(struct varlena *attr)
 {
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (VARATT_IS_EXTERNAL(attr))
 	{
-		/*
-		 * This is an externally stored datum --- fetch it back from there
-		 */
-		attr = toast_fetch_datum(attr);
-		/* If it's compressed, decompress it */
-		if (VARATT_IS_COMPRESSED(attr))
-		{
-			struct varlena *tmp = attr;
+		DecodedExternalToast decoded;
 
-			attr = toast_decompress_datum(tmp);
-			pfree(tmp);
+		if (decode_external_toast_pointer(attr, &decoded))
+		{
+			struct varlena *fetched = toast_fetch_datum_decoded(&decoded);
+
+			if (decoded.method != TOAST_DECOMP_NONE)
+			{
+				struct varlena *result = toast_decompress_decoded(fetched, &decoded);
+				pfree(fetched);
+				return result;
+			}
+			return fetched;
+		}
+
+		/* Decode failed: INDIRECT, EXPANDED, or unrecognized compression */
+		if (VARATT_IS_EXTERNAL_ONDISK(attr))
+		{
+			/* Unrecognized compression - legacy path preserves error behavior */
+			attr = toast_fetch_datum(attr);
+			if (VARATT_IS_COMPRESSED(attr))
+			{
+				struct varlena *tmp = attr;
+
+				attr = toast_decompress_datum(tmp);
+				pfree(tmp);
+			}
+			return attr;
+		}
+		else if (VARATT_IS_EXTERNAL_INDIRECT(attr))
+		{
+			/*
+			 * This is an indirect pointer --- dereference it
+			 */
+			struct varatt_indirect redirect;
+
+			VARATT_EXTERNAL_GET_POINTER(redirect, attr);
+			attr = (struct varlena *) redirect.pointer;
+
+			/* nested indirect Datums aren't allowed */
+			Assert(!VARATT_IS_EXTERNAL_INDIRECT(attr));
+
+			/* recurse in case value is still extended in some other way */
+			attr = detoast_attr(attr);
+
+			/* if it isn't, we'd better copy it */
+			if (attr == (struct varlena *) redirect.pointer)
+			{
+				struct varlena *result;
+
+				result = (struct varlena *) palloc(VARSIZE_ANY(attr));
+				memcpy(result, attr, VARSIZE_ANY(attr));
+				attr = result;
+			}
+			return attr;
+		}
+		else if (VARATT_IS_EXTERNAL_EXPANDED(attr))
+		{
+			/*
+			 * This is an expanded-object pointer --- get flat format
+			 */
+			attr = detoast_external_attr(attr);
+			/* flatteners are not allowed to produce compressed/short output */
+			Assert(!VARATT_IS_EXTENDED(attr));
+			return attr;
 		}
 	}
-	else if (VARATT_IS_EXTERNAL_INDIRECT(attr))
-	{
-		/*
-		 * This is an indirect pointer --- dereference it
-		 */
-		struct varatt_indirect redirect;
 
-		VARATT_EXTERNAL_GET_POINTER(redirect, attr);
-		attr = (struct varlena *) redirect.pointer;
-
-		/* nested indirect Datums aren't allowed */
-		Assert(!VARATT_IS_EXTERNAL_INDIRECT(attr));
-
-		/* recurse in case value is still extended in some other way */
-		attr = detoast_attr(attr);
-
-		/* if it isn't, we'd better copy it */
-		if (attr == (struct varlena *) redirect.pointer)
-		{
-			struct varlena *result;
-
-			result = (struct varlena *) palloc(VARSIZE_ANY(attr));
-			memcpy(result, attr, VARSIZE_ANY(attr));
-			attr = result;
-		}
-	}
-	else if (VARATT_IS_EXTERNAL_EXPANDED(attr))
-	{
-		/*
-		 * This is an expanded-object pointer --- get flat format
-		 */
-		attr = detoast_external_attr(attr);
-		/* flatteners are not allowed to produce compressed/short output */
-		Assert(!VARATT_IS_EXTENDED(attr));
-	}
-	else if (VARATT_IS_COMPRESSED(attr))
+	/* Handle inline cases (not external) */
+	if (VARATT_IS_COMPRESSED(attr))
 	{
 		/*
 		 * This is a compressed value inside of the main tuple
@@ -223,63 +308,75 @@ detoast_attr_slice(struct varlena *attr,
 	else if (pg_add_s32_overflow(sliceoffset, slicelength, &slicelimit))
 		slicelength = slicelimit = -1;
 
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	if (VARATT_IS_EXTERNAL(attr))
 	{
-		struct varatt_external toast_pointer;
+		DecodedExternalToast decoded;
 
-		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
-
-		/* fast path for non-compressed external datums */
-		if (!VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer))
-			return toast_fetch_datum_slice(attr, sliceoffset, slicelength);
-
-		/*
-		 * For compressed values, we need to fetch enough slices to decompress
-		 * at least the requested part (when a prefix is requested).
-		 * Otherwise, just fetch all slices.
-		 */
-		if (slicelimit >= 0)
+		if (decode_external_toast_pointer(attr, &decoded))
 		{
-			int32		max_size = VARATT_EXTERNAL_GET_EXTSIZE(toast_pointer);
+			if (decoded.method == TOAST_DECOMP_NONE)
+				return toast_fetch_datum_slice(attr, sliceoffset, slicelength);
 
-			/*
-			 * Determine maximum amount of compressed data needed for a prefix
-			 * of a given length (after decompression).
-			 *
-			 * At least for now, if it's LZ4 data, we'll have to fetch the
-			 * whole thing, because there doesn't seem to be an API call to
-			 * determine how much compressed data we need to be sure of being
-			 * able to decompress the required slice.
-			 */
-			if (VARATT_EXTERNAL_GET_COMPRESS_METHOD(toast_pointer) ==
-				TOAST_PGLZ_COMPRESSION_ID)
-				max_size = pglz_maximum_compressed_size(slicelimit, max_size);
+			/* Compressed: fetch enough to decompress the requested prefix */
+			if (slicelimit >= 0)
+			{
+				int32		max_size = decoded.extsize;
 
-			/*
-			 * Fetch enough compressed slices (compressed marker will get set
-			 * automatically).
-			 */
-			preslice = toast_fetch_datum_slice(attr, 0, max_size);
+				/* PGLZ supports partial decompression; LZ4 needs all data */
+				if (decoded.method == TOAST_DECOMP_PGLZ)
+					max_size = pglz_maximum_compressed_size(slicelimit, max_size);
+
+				preslice = toast_fetch_datum_slice(attr, 0, max_size);
+			}
+			else
+				preslice = toast_fetch_datum_decoded(&decoded);
+		}
+		else if (VARATT_IS_EXTERNAL_ONDISK(attr))
+		{
+			/* Unrecognized compression - legacy path */
+			struct varatt_external toast_pointer;
+
+			VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+
+			if (!VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer))
+				return toast_fetch_datum_slice(attr, sliceoffset, slicelength);
+
+			if (slicelimit >= 0)
+			{
+				int32		max_size = VARATT_EXTERNAL_GET_EXTSIZE(toast_pointer);
+
+				if (VARATT_EXTERNAL_GET_COMPRESS_METHOD(toast_pointer) ==
+					TOAST_PGLZ_COMPRESSION_ID)
+					max_size = pglz_maximum_compressed_size(slicelimit, max_size);
+
+				preslice = toast_fetch_datum_slice(attr, 0, max_size);
+			}
+			else
+				preslice = toast_fetch_datum(attr);
+		}
+		else if (VARATT_IS_EXTERNAL_INDIRECT(attr))
+		{
+			struct varatt_indirect redirect;
+
+			VARATT_EXTERNAL_GET_POINTER(redirect, attr);
+
+			/* nested indirect Datums aren't allowed */
+			Assert(!VARATT_IS_EXTERNAL_INDIRECT(redirect.pointer));
+
+			return detoast_attr_slice(redirect.pointer,
+									  sliceoffset, slicelength);
+		}
+		else if (VARATT_IS_EXTERNAL_EXPANDED(attr))
+		{
+			/* pass it off to detoast_external_attr to flatten */
+			preslice = detoast_external_attr(attr);
 		}
 		else
-			preslice = toast_fetch_datum(attr);
-	}
-	else if (VARATT_IS_EXTERNAL_INDIRECT(attr))
-	{
-		struct varatt_indirect redirect;
-
-		VARATT_EXTERNAL_GET_POINTER(redirect, attr);
-
-		/* nested indirect Datums aren't allowed */
-		Assert(!VARATT_IS_EXTERNAL_INDIRECT(redirect.pointer));
-
-		return detoast_attr_slice(redirect.pointer,
-								  sliceoffset, slicelength);
-	}
-	else if (VARATT_IS_EXTERNAL_EXPANDED(attr))
-	{
-		/* pass it off to detoast_external_attr to flatten */
-		preslice = detoast_external_attr(attr);
+		{
+			/* Should not reach here - unknown external type */
+			elog(ERROR, "unexpected external varlena type");
+			preslice = attr;	/* keep compiler quiet */
+		}
 	}
 	else
 		preslice = attr;
@@ -460,6 +557,61 @@ toast_fetch_datum_slice(struct varlena *attr, int32 sliceoffset,
 	table_close(toastrel, AccessShareLock);
 
 	return result;
+}
+
+/* ----------
+ * toast_fetch_datum_decoded -
+ *
+ *	Fetch TOAST data using pre-decoded pointer info.
+ * ----------
+ */
+static struct varlena *
+toast_fetch_datum_decoded(const DecodedExternalToast *decoded)
+{
+	Relation	toastrel;
+	struct varlena *result;
+	int32		attrsize = decoded->extsize;
+
+	result = (struct varlena *) palloc(attrsize + VARHDRSZ);
+
+	/* HAS_TCINFO determines header format, not "is compressed" */
+	if (decoded->flags & TOAST_EXT_HAS_TCINFO)
+		SET_VARSIZE_COMPRESSED(result, attrsize + VARHDRSZ);
+	else
+		SET_VARSIZE(result, attrsize + VARHDRSZ);
+
+	if (attrsize == 0)
+		return result;
+
+	toastrel = table_open(decoded->toastrelid, AccessShareLock);
+	table_relation_fetch_toast_slice(toastrel, decoded->valueid,
+									 attrsize, 0, attrsize, result);
+	table_close(toastrel, AccessShareLock);
+
+	return result;
+}
+
+/* ----------
+ * toast_decompress_decoded -
+ *
+ *	Decompress TOAST data using decoded method.
+ * ----------
+ */
+static struct varlena *
+toast_decompress_decoded(const struct varlena *compressed,
+						 const DecodedExternalToast *decoded)
+{
+	switch (decoded->method)
+	{
+		case TOAST_DECOMP_PGLZ:
+			return pglz_decompress_datum(compressed);
+		case TOAST_DECOMP_LZ4:
+			return lz4_decompress_datum(compressed);
+		case TOAST_DECOMP_NONE:
+		default:
+			elog(ERROR, "unexpected decompression method %d", decoded->method);
+			return NULL;
+	}
 }
 
 /* ----------
