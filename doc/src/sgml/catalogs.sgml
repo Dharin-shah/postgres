@@ -3964,6 +3964,13 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
    for details about extensions.
   </para>
 
+  <para>
+   Like most system catalogs, <structname>pg_extension</structname> is not
+   shared across databases: there is one copy of <structname>pg_extension</structname>
+   per database, not one per cluster.  Consequently, extensions must be
+   installed separately in each database where they are needed.
+  </para>
+
   <table>
    <title><structname>pg_extension</structname> Columns</title>
    <tgroup cols="1">
