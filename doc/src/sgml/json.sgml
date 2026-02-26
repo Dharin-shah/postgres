@@ -884,7 +884,6 @@ UPDATE table_name SET jsonb_field[1]['a'] = '1';
         A named variable. Its value can be set by the parameter
         <parameter>vars</parameter> of several JSON processing functions;
         see <xref linkend="functions-json-processing-table"/> for details.
-        <!-- TODO: describe PASSING clause once implemented !-->
       </entry>
      </row>
      <row>
