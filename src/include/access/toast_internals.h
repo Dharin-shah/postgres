@@ -16,6 +16,45 @@
 #include "storage/lockdefs.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
+#include "varatt.h"
+
+/*
+ * Decompression method for decoded toast pointers. Separate from
+ * ToastCompressionId (2-bit on-disk encoding) to allow future methods.
+ */
+typedef enum ToastDecompressMethod
+{
+	TOAST_DECOMP_NONE = 0,
+	TOAST_DECOMP_PGLZ = 1,
+	TOAST_DECOMP_LZ4 = 2
+} ToastDecompressMethod;
+
+/*
+ * Flags for DecodedExternalToast.
+ *
+ * HAS_TCINFO: Payload starts with tcinfo header. True for PGLZ/LZ4 external;
+ *   false for uncompressed or future methods storing raw compressed data.
+ * IS_ONDISK: Set for VARTAG_ONDISK (for future vartag extension).
+ */
+#define TOAST_EXT_HAS_TCINFO	0x01
+#define TOAST_EXT_IS_ONDISK		0x02
+
+/*
+ * Decoded representation of an external on-disk TOAST pointer.
+ * Normalizes vartag/va_extinfo variations; decode once, use throughout.
+ *
+ * HAS_TCINFO indicates payload format (has tcinfo header), distinct from
+ * "is compressed" (extsize < rawsize) - future methods may omit tcinfo.
+ */
+typedef struct DecodedExternalToast
+{
+	Oid			toastrelid;
+	Oid			valueid;
+	uint32		rawsize;		/* Decompressed size; for future methods without tcinfo */
+	uint32		extsize;		/* On-disk payload size */
+	ToastDecompressMethod method;
+	uint8		flags;
+} DecodedExternalToast;
 
 /*
  *	The information at the start of the compressed toast data.
